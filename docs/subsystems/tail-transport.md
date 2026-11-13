@@ -132,6 +132,58 @@ and a provider at the inference service, one with a `tail=on` provider pointed a
 the first — and compare what a TCP counter between them sees against the same
 turns sent as plain JSON.
 
+The conditions a real deployment runs in — several sessions at once, replies
+arriving out of order, the gateway restarted under a conversation — are checked
+by the tail repository's `tools/hardcases.py`, which drives two real binaries and
+counts bytes on the wire between them:
+
+```sh
+python -m tools.hardcases --magpie /tmp/magpie-tail --check all --sessions 4 --rounds 3
+```
+
+## Concurrent sessions, out-of-order replies, restarts
+
+Three things that do not change a single byte of the wire format but can make the
+numbers lie or the saving quietly disappear.
+
+**Several sessions at once.** Credentials are keyed by the body's own first
+block (`Prepared.Session`), so two conversations cannot share one: the key is
+content, not a name. A parallel burst of four sessions × three turns arrives at
+the inference service as twelve complete, un-mixed histories.
+
+**Replies out of order.** `tail.Client` keeps four credentials per session
+(`maxCredentials`), and `Prepare` picks the *longest* prefix they prove, not the
+last one written. This matters because a later request in a conversation can be
+answered before an earlier one: with a single credential, the late short reply
+overwrites the long one, and the next turn still "works" — still hits, still
+saves — while claiming a prefix that is far shorter than it could. Nothing
+errors; the saving just drains away. Measured cold on one conversation, four
+requests in flight with the shortest one answered last:
+
+| Credentials kept | Next turn up | Full text |
+| --- | ---: | ---: |
+| 4 (`maxCredentials`) | 20,495 B | 130,609 B |
+| 1 | 80,910 B | 130,609 B |
+
+So the entry a single-credential table keeps is not just "one turn stale": it is
+whichever turn happened to answer last.
+
+**A restart under a conversation.** The block cache is memory, so a restarted
+gateway holds none of the prefixes its clients believe in. The first turn after
+a restart therefore pays for the failed attempt *and* the whole request — and
+then recovers:
+
+| Turn after restart | Upload | Full text |
+| ---: | ---: | ---: |
+| 1 | 106,475 B | 90,709 B |
+| 2 | 15,658 B | 105,805 B |
+| 3 | 15,923 B | 120,883 B |
+| 4 | 15,762 B | 136,048 B |
+
+The first row is larger than the full text because it holds both: the 15,766 B
+tail sent on the stale credential (refused with `409`) and the 90,709 B resend.
+That is the whole cost of a restart — one wasted round, no error at the agent.
+
 ## What it is worth, by turn kind
 
 The saving is prefix-shaped, so it is not one number. Over a trace with the
