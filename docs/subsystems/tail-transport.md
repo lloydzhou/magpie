@@ -131,3 +131,28 @@ For the two ends together, run two of the built binary — one with `MAGPIE_TAIL
 and a provider at the inference service, one with a `tail=on` provider pointed at
 the first — and compare what a TCP counter between them sees against the same
 turns sent as plain JSON.
+
+## What it is worth, by turn kind
+
+The saving is prefix-shaped, so it is not one number. Over a trace with the
+events a real agent produces (appends, a compaction, a branch, a tool added
+mid-conversation, two sessions), 20 turns of ~40 KB system prompt and ~24 KB a
+turn, 25 Mbit/s uplink, two magpies and a throttle between them:
+
+| Turn kind | Turns | Plain up | Tail up | Plain upload | Tail upload | Saving |
+| --- | --- | --- | --- | --- | --- | --- |
+| append | 16 | 3.27 MB | 0.69 MB | 1,337 ms | 253 ms | 4.7x |
+| branch | 2 | 0.37 MB | 0.23 MB | 153 ms | 90 ms | 1.7x |
+| new tools | 1 | 0.18 MB | 0.18 MB | 73 ms | 74 ms | 1.0x |
+| compaction | 1 | 0.12 MB | 0.12 MB | 49 ms | 50 ms | 1.0x |
+| total | 20 | 3.85 MB | 1.18 MB | 1,612 ms | 466 ms | 3.3x |
+
+The rows that matter as much as the total are the ones at 1.0x: a compaction or a
+reordered history is un-savable by construction, since the prefix itself changed,
+and that turn costs what it always did. So the transport pays on the turns a
+conversation is growing — which is most of them — and pays nothing on the ones
+that rewrite it.
+
+The same trace at 10 Mbit/s takes plain 3.95 s against tail 0.90 s, and the plain
+upload time rises by the ratio the bandwidth fell by: the throttle measures the
+upload, not just the clock.
