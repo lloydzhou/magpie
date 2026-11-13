@@ -1255,6 +1255,18 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.SecretAccessKey = v
 		case "models.url":
 			p.ModelsURL = v
+		case "tail":
+			// on: this provider's chat requests go over the tail transport,
+			// for one that is another magpie with its gateway's tail switch
+			// on (tail=on|off)
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "on", "yes":
+				p.Tail = true
+			case "off", "no", "":
+				p.Tail = false
+			default:
+				return fmt.Errorf("tail=on|off, not %q", v)
+			}
 		case "list":
 			// off: the vendor's model list is never asked for, and only
 			// the models given by id are served (axelburks on Discord)

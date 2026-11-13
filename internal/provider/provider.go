@@ -137,6 +137,13 @@ type Provider struct {
 	// as long as that lasts.
 	Routing string `json:"routing,omitempty"`
 
+	// Tail sends this provider's chat requests over the tail transport
+	// (internal/tail, gateway/tail_wire.go): only the bytes the far end
+	// doesn't hold go up, which is most of what a home uplink's upload time
+	// is made of. For a provider that is another magpie, with its gateway's
+	// own tail switch on. Off, the default, every request goes whole.
+	Tail bool `json:"tail,omitempty"`
+
 	// Sink sends a key or account that a 429 rate limited while it still
 	// had quota to the back of the order Routing gives (01huadalang): it
 	// is tried again only after every one not rate limited since — so the
