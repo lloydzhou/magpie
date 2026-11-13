@@ -124,8 +124,11 @@ block boundary never hit.
 
 `internal/gateway/tail_wire_test.go` covers: a tail turn reaching the vendor
 whole, the switch being what serves one, a provider marked `tail=on` sending
-only its new bytes, and a far end that lost the prefix being asked for the whole
-request exactly once.
+only its new bytes, a far end that lost the prefix being asked for the whole
+request exactly once, four conversations in flight together arriving as twelve
+un-mixed histories, and a far end that came back empty being recovered from in
+one turn. `internal/tail/codec_test.go` pins the credential table under
+out-of-order replies (and shows what a one-entry table would have lost).
 
 For the two ends together, run two of the built binary — one with `MAGPIE_TAIL=1`
 and a provider at the inference service, one with a `tail=on` provider pointed at
@@ -159,6 +162,9 @@ overwrites the long one, and the next turn still "works" — still hits, still
 saves — while claiming a prefix that is far shorter than it could. Nothing
 errors; the saving just drains away. Measured cold on one conversation, four
 requests in flight with the shortest one answered last:
+
+These are the numbers those two tests pin (bytes on a real wire, two processes,
+measured by the tail repository's `tools/hardcases.py`):
 
 | Credentials kept | Next turn up | Full text |
 | --- | ---: | ---: |

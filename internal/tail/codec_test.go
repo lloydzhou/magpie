@@ -697,3 +697,98 @@ func TestRenderAcceptsGoNativeTypes(t *testing.T) {
 		t.Fatalf("native payload rendered\n got: %s\nwant: %s", got, want)
 	}
 }
+
+// TestOutOfOrderRepliesKeepTheLongestPrefix: several requests of one
+// conversation can be in flight at once, and a later request may be answered
+// before an earlier one.
+//
+// The credential table keeps more than one entry per session for exactly this:
+// with a single entry, the reply that happens to arrive last wins — and if that
+// is the shortest one, the next turn still "works", still hits, and still saves,
+// while naming a prefix far shorter than it could. Nothing errors; the saving
+// just drains away. So this test pins both halves: the longest prefix wins, and
+// a one-entry table would indeed have lost it.
+func TestOutOfOrderRepliesKeepTheLongestPrefix(t *testing.T) {
+	server := NewServer(NewMemoryStore(0))
+	short, mid, long := requestPayload(4), requestPayload(6), requestPayload(8)
+
+	// Three requests of one conversation, all prepared before any reply came
+	// back: the state of a client with several requests in flight.
+	c := NewClient()
+	prepShort, err := c.Prepare(short)
+	if err != nil {
+		t.Fatalf("Prepare short: %v", err)
+	}
+	prepMid, err := c.Prepare(mid)
+	if err != nil {
+		t.Fatalf("Prepare mid: %v", err)
+	}
+	if !bytes.Equal(prepShort.Session, prepMid.Session) {
+		t.Fatal("one conversation ended up with two session keys")
+	}
+	for _, p := range []*Prepared{prepShort, prepMid} {
+		if p.HaveLen != 0 {
+			t.Fatalf("a request prepared before any reply claimed a %d byte prefix", p.HaveLen)
+		}
+	}
+
+	decShort, err := server.Decode(context.Background(), prepShort.HaveLen, prepShort.HaveTip, prepShort.Body)
+	if err != nil {
+		t.Fatalf("Decode short: %v", err)
+	}
+	decMid, err := server.Decode(context.Background(), prepMid.HaveLen, prepMid.HaveTip, prepMid.Body)
+	if err != nil {
+		t.Fatalf("Decode mid: %v", err)
+	}
+	if decMid.HaveLen <= decShort.HaveLen {
+		t.Fatalf("the longer conversation left %d bytes, the shorter %d",
+			decMid.HaveLen, decShort.HaveLen)
+	}
+
+	// The replies come back the wrong way round: the long one first, the short
+	// one last.
+	replies := []struct {
+		session []byte
+		decoded *Decoded
+	}{
+		{prepMid.Session, decMid},
+		{prepShort.Session, decShort},
+	}
+	for _, r := range replies {
+		h := http.Header{}
+		h.Set(HeaderHave, r.decoded.HaveHeader())
+		c.UpdateFromHeaders(r.session, h)
+	}
+
+	next, err := c.Prepare(long)
+	if err != nil {
+		t.Fatalf("Prepare long: %v", err)
+	}
+	if next.HaveLen != decMid.HaveLen {
+		t.Fatalf("after out-of-order replies the next turn named %d bytes, want the longest %d",
+			next.HaveLen, decMid.HaveLen)
+	}
+
+	// The same replies into a table that keeps one entry per session: the last
+	// reply to arrive hides the longer one, and the turn costs what that miss
+	// costs. This is what maxCredentials is buying.
+	single := NewClient()
+	single.maxCredentials = 1
+	for _, r := range replies {
+		h := http.Header{}
+		h.Set(HeaderHave, r.decoded.HaveHeader())
+		single.UpdateFromHeaders(r.session, h)
+	}
+	nextSingle, err := single.Prepare(long)
+	if err != nil {
+		t.Fatalf("Prepare long (single): %v", err)
+	}
+	if nextSingle.HaveLen != decShort.HaveLen {
+		t.Fatalf("a one-entry table named %d bytes, want the shortest %d",
+			nextSingle.HaveLen, decShort.HaveLen)
+	}
+	if len(nextSingle.Body) <= len(next.Body) {
+		t.Fatalf("a one-entry table sent %d bytes and a four-entry table %d: keeping more "+
+			"credentials must save", len(nextSingle.Body), len(next.Body))
+	}
+}

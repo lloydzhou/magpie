@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,7 @@ type tailUpstream struct {
 	srv      *tail.Server
 	refuse   bool // answer the first request that names a prefix with a 409
 	refused  int
+	lost     int // prefixes the store truly did not hold (a restart, not a test flag)
 	requests int
 }
 
@@ -114,6 +116,9 @@ func newTailUpstream(t *testing.T) (*tailUpstream, string) {
 			u.mu.Unlock()
 			dec, err := tailSrv.Decode(r.Context(), haveLen, haveTip, b)
 			if err != nil {
+				u.mu.Lock()
+				u.lost++
+				u.mu.Unlock()
 				w.Header().Set(tail.HeaderRetransmit, "1")
 				w.WriteHeader(http.StatusConflict)
 				return
@@ -341,5 +346,208 @@ func TestTailFarEndThatLostThePrefixGetsTheWholeRequest(t *testing.T) {
 	}
 	if !strings.Contains(decoded, "继续。") {
 		t.Fatalf("the retry wasn't the whole request: %s", decoded)
+	}
+}
+
+// tailSessionTurn is one conversation's history at a given length. The opening
+// line differs per session, so each conversation is its own tail session.
+func tailSessionTurn(session, turns int) []map[string]any {
+	msgs := []map[string]any{
+		{"role": "system", "content": strings.Repeat(fmt.Sprintf("会话%d的系统提示。", session), 120)},
+	}
+	for i := 0; i < turns; i++ {
+		// A tool answer belongs to a tool call: a tool message with no
+		// tool_calls above it is an orphan, and the gateway's fixups turn one
+		// into a plain user message — which would change the very sequence this
+		// test compares. So each turn is a well-formed tool round.
+		callID := fmt.Sprintf("call_%d_%d", session, i)
+		msgs = append(msgs,
+			map[string]any{"role": "user",
+				"content": fmt.Sprintf("会话%d第%d问。", session, i+1) + strings.Repeat("输入。", 30)},
+			map[string]any{"role": "assistant",
+				"content": fmt.Sprintf("会话%d第%d答。", session, i+1) + strings.Repeat("输出。", 30),
+				"tool_calls": []map[string]any{{
+					"id": callID, "type": "function",
+					"function": map[string]any{"name": "run", "arguments": "{}"},
+				}}},
+			map[string]any{"role": "tool", "tool_call_id": callID,
+				"content": strings.Repeat("命令输出。", 40)},
+		)
+	}
+	return msgs
+}
+
+// canonicalMessages is the comparison form of a message list: the sequence of
+// roles and contents, and nothing else.
+//
+// Not the whole JSON: by the time the vendor sees a request, the gateway has
+// applied the provider's own fixups, which may add fields. The question this
+// test asks is only whether one conversation's messages were ever answered as
+// another's, and that is decided by the role/content sequence.
+func canonicalMessages(t *testing.T, msgs []map[string]any) string {
+	t.Helper()
+	var b strings.Builder
+	for _, m := range msgs {
+		fmt.Fprintf(&b, "%v\x00%v\x01", m["role"], m["content"])
+	}
+	return b.String()
+}
+
+// TestTailParallelSessionsDoNotMix: an agent opens several conversations at
+// once, and their requests are in flight together.
+//
+// The credential key is the body's own first block, not a name the client had to
+// invent, so two conversations cannot share one: the request the far end puts
+// back together is always exactly one conversation at one of its lengths, never
+// a prefix borrowed from another. If this mixed, the saving would look better
+// than it is — one conversation claiming another's prefix as its own.
+func TestTailParallelSessionsDoNotMix(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	tailRegisters(t, url, true)
+
+	const sessions, turns = 4, 3
+	srv := New()
+
+	// Every payload is built before anything is sent: the far end must see
+	// exactly these histories, in any order.
+	type pending struct {
+		body string
+		want string
+	}
+	queue := make([]pending, 0, sessions*turns)
+	for session := 0; session < sessions; session++ {
+		for turn := 1; turn <= turns; turn++ {
+			msgs := tailSessionTurn(session, turn)
+			queue = append(queue, pending{
+				body: string(tailPayload(t, "peer/m", msgs)),
+				want: canonicalMessages(t, msgs),
+			})
+		}
+	}
+
+	codes := make([]int, len(queue))
+	var wg sync.WaitGroup
+	for i := range queue {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(queue[i].body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+Token)
+			srv.Handler().ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for i, code := range codes {
+		if code != 200 {
+			t.Fatalf("request %d: %d", i, code)
+		}
+	}
+	u.mu.Lock()
+	decoded := append([]string(nil), u.decoded...)
+	types := append([]string(nil), u.types...)
+	u.mu.Unlock()
+	if len(decoded) != len(queue) {
+		t.Fatalf("the far end was asked %d requests, want %d", len(decoded), len(queue))
+	}
+	// and they really went over the transport, or this proves nothing
+	for i, ct := range types {
+		if !tail.IsContentType(ct) {
+			t.Fatalf("request %d went as %q, not the tail transport", i, ct)
+		}
+	}
+
+	// Each history the test built must appear exactly once among what the far
+	// end put back together — a bijection, not merely "no garbage".
+	seen := make(map[string]int, len(decoded))
+	for _, d := range decoded {
+		var payload struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(d), &payload); err != nil {
+			t.Fatalf("the far end put together something that isn't a request: %s", d)
+		}
+		seen[canonicalMessages(t, payload.Messages)]++
+	}
+	for _, p := range queue {
+		switch seen[p.want] {
+		case 1:
+			delete(seen, p.want)
+		case 0:
+			t.Fatalf("a conversation's history never reached the far end: %q", p.want[:120])
+		default:
+			t.Fatalf("a conversation's history reached the far end %d times", seen[p.want])
+		}
+	}
+	if len(seen) != 0 {
+		t.Fatalf("%d histories reached the far end that no session sent", len(seen))
+	}
+}
+
+// TestTailRecoversAfterTheFarEndStartsWithNothing: the far end's block cache is
+// memory, so a restart under a conversation leaves the client naming a prefix
+// nobody holds.
+//
+// One turn pays for that: the refused tail and then the whole request. The turn
+// after it must be cheap again — a transport that stayed expensive after a
+// restart would be worse than not having it.
+func TestTailRecoversAfterTheFarEndStartsWithNothing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	tailRegisters(t, url, true)
+
+	srv := New()
+	msgs := tailSessionTurn(0, 1)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// the far end comes back with an empty cache, as a restarted process would
+	u.mu.Lock()
+	u.srv = tail.NewServer(tail.NewMemoryStore(0))
+	u.mu.Unlock()
+
+	msgs = tailSessionTurn(0, 2)
+	second := tailPayload(t, "peer/m", msgs)
+	if rec := chatAsk(t, srv, string(second)); rec.Code != 200 {
+		t.Fatalf("turn after the restart: %d %s", rec.Code, rec.Body.String())
+	}
+	u.mu.Lock()
+	lost := u.lost
+	u.mu.Unlock()
+	if lost != 1 {
+		t.Fatalf("the far end refused %d prefixes, want exactly 1: one restart costs one round", lost)
+	}
+	if _, body, decoded := u.last(t); len(body) < len(second)*9/10 {
+		t.Fatalf("the turn after a restart went as %d of %d bytes: it must be the whole request",
+			len(body), len(second))
+	} else if !strings.Contains(decoded, "会话0第2问") {
+		t.Fatalf("the resent request is missing this turn: %s", decoded)
+	}
+
+	// and the next turn is cheap again
+	msgs = tailSessionTurn(0, 3)
+	third := tailPayload(t, "peer/m", msgs)
+	if rec := chatAsk(t, srv, string(third)); rec.Code != 200 {
+		t.Fatalf("third turn: %d %s", rec.Code, rec.Body.String())
+	}
+	u.mu.Lock()
+	lost = u.lost
+	u.mu.Unlock()
+	if lost != 1 {
+		t.Fatalf("%d prefixes refused in total: recovery must not cost a second round", lost)
+	}
+	if _, body, decoded := u.last(t); len(body) >= len(third)/2 {
+		t.Fatalf("the turn after the recovery went as %d of %d bytes: it did not recover",
+			len(body), len(third))
+	} else if !strings.Contains(decoded, "会话0第3问") {
+		t.Fatalf("the recovered turn is missing its own messages: %s", decoded)
 	}
 }
