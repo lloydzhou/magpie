@@ -50,9 +50,10 @@ The same panel holds the four numbers, from the plugin's `Settings` struct
 | `cacheMB` | 256 | megabytes the block cache may hold |
 
 They are read on the plugin's `Apply`, so an edited value applies when the
-transport is turned off and on again, or magpie starts. The switch itself is
-immediate: the plugin serves `internal/tail`'s point on `Apply` and stops it on
-dispose, so the next request sees it (nothing is cached — `tail.Served()`).
+transport is turned off and on again, or magpie starts. The switch follows
+plugins.yml like every other built-in's (`pluginrt.KeepFresh` reconciles within a
+second or two); the point itself caches nothing — `tail.Served()` reads the state
+`Apply` and dispose leave — so the request after that sees it.
 
 ## Wire format
 
