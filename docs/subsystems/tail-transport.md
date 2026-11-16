@@ -52,6 +52,43 @@ Block ids are `blake2b(parent_id || block)[:16]`, the chain root's parent being
 no bytes at all. Only full blocks are stored, so a turn is charged one block of
 re-alignment plus its own new bytes.
 
+## The handshake, and why the body may stop being JSON
+
+Every other request magpie sends is a JSON body. A tail request is not: it is the
+rendered text from some offset on. So before the first one goes out, the egress
+asks the far end what it takes:
+
+```
+OPTIONS {the URL the request would POST to}
+  -> 204, Allow: POST, OPTIONS
+     X-Tail-Version: 3
+     X-Tail-Block: 512
+```
+
+`OPTIONS` on the path the request itself uses, rather than a new endpoint: there
+is nothing new for a far end to implement, and a server that has no OPTIONS, has
+another version, keeps another block size, or answers through a proxy instead of
+the origin simply never gets sent a tail. Its turns are the JSON they always
+were. The block size is in the answer because two implementations that disagree
+on it never hit — the client would name a boundary the peer's chain does not have
+— so it is advertised instead of assumed. A gateway with `MAGPIE_TAIL` off
+answers too, without `X-Tail-Version`: "JSON only" is an answer worth having.
+
+Two consequences worth stating plainly:
+
+- **Deployment order stops mattering.** The client may be given `tail=on` before
+  the far end is upgraded; it asks, is told no, and sends whole requests until
+  the answer changes. The old failure mode was a first request that wasn't JSON
+  meeting a server that parsed JSON: a 400/415 per turn, counted as an upstream
+  failure.
+- **A lying far end costs one retry, not a broken turn.** If it answered the
+  handshake and then refused a tail as a body it couldn't read (it was replaced
+  under a running gateway), the request goes again as plain JSON, the transport
+  is left off, and it is asked again after a few minutes. A refusal of the
+  *request* — a content policy, a bad tool pair — is not mistaken for that: the
+  reply is read first, and only a refusal that names JSON or the content type
+  triggers it.
+
 ## Runtime paths
 
 Ingress, one Chat turn:
@@ -72,7 +109,9 @@ Egress, one Chat turn:
 
 1. `Server.forwardOnce` finalizes the body, then calls `Server.tailOut`. A
    provider without `tail=on`, another protocol, or an encoded body leaves the
-   request untouched.
+   request untouched. So does a far end that has not answered the handshake:
+   `tailOut` asks `tailCapable` first, which probes at most once per provider
+   (and once every few minutes after a "no").
 2. `tailOut` asks the provider's credential table for a `Prepared` request, sets
    the tail as the request body, `application/x-tail-v3` as the content type and
    the prefix in `X-Tail-Have`. What the ledger counts as sent is the tail's
@@ -86,6 +125,9 @@ Egress, one Chat turn:
 
 ## State
 
+- **Capability**: per provider, in memory (`Server.tailCaps`), the far end's
+  answer to the handshake and when a "no" may be asked again. Not persisted: a
+  restarted gateway asks again, which is one OPTIONS.
 - **Client credential table**: per provider, in memory (`Server.tailClients`),
   `session → [(length, tip)]`. A session is the body's own content, so it needs
   no bookkeeping across restarts: a fresh gateway simply misses and gets the
@@ -98,7 +140,10 @@ Egress, one Chat turn:
 ## Failure and compatibility
 
 - Both switches off (the default): no behavior change anywhere. A body that
-  isn't JSON is rejected exactly as before.
+  isn't JSON is rejected exactly as before, and a request that isn't a tail is
+  never probed.
+- A far end that doesn't answer the handshake is never sent a tail, so its turns
+  are byte-identical to what magpie sent before this transport existed.
 - A far end that lost the prefix costs one 409 and one full upload; the agent
   never sees it.
 - A body the codec can't render is sent whole: the transport never turns a

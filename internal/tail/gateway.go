@@ -37,7 +37,11 @@ const (
 	// Version is the wire version (incompatible with v2).
 	Version = "3"
 
-	HeaderVersion    = "X-Tail-Version"
+	HeaderVersion = "X-Tail-Version"
+	// HeaderBlock is the handshake's block size. Two implementations that
+	// disagree on it never hit -- the client names a boundary the peer's chain
+	// does not have -- so it is advertised rather than assumed.
+	HeaderBlock      = "X-Tail-Block"
 	HeaderStatus     = "X-Tail-Status"
 	HeaderHit        = "X-Tail-Hit"
 	HeaderRetransmit = "X-Tail-Retransmit"

@@ -1,12 +1,19 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/tail"
 )
@@ -23,7 +30,11 @@ import (
 //
 // Both ends are magpies, each behind a switch of its own: MAGPIE_TAIL turns this
 // gateway's ingress into something that puts such a request back together, and
-// provider.Provider.Tail makes the egress send one. Nothing else in the gateway
+// provider.Provider.Tail makes the egress send one. Because the body stops being
+// JSON, the egress has to know the far end takes it before the first one goes
+// out, so it asks: an OPTIONS on the very URL it would POST to (tailProbe). A
+// far end that does not say so is never sent a tail, and a far end that lies
+// costs one plain retry, not a broken turn. Nothing else in the gateway
 // changes — what tailIngress hands on is the JSON body every later stage was
 // already written for, and the far end answers an ordinary chat completions
 // request, so protocol translation, routing and the provider's own fixups all
@@ -42,6 +53,16 @@ const (
 	// are worth less than the memory: 256 MB holds roughly 480 sessions the
 	// size of a large Codex turn.
 	tailCacheBytes = 256 << 20
+
+	// tailProbeTimeout bounds the handshake. It runs inside a request, so it is
+	// shorter than any turn: a far end that cannot answer it in this long is
+	// treated as not taking the transport, which is always the safe answer.
+	tailProbeTimeout = 3 * time.Second
+
+	// tailProbeAgain is how long "it doesn't take it" is believed before it is
+	// asked again. Long enough not to pay a probe per turn, short enough that a
+	// far end upgraded at noon is used before the afternoon is over.
+	tailProbeAgain = 5 * time.Minute
 )
 
 // tailIngress puts a request's body back together when it came over the tail
@@ -115,6 +136,167 @@ func (s *Server) tailClientFor(p provider.Provider) *tail.Client {
 	return actual.(*tail.Client)
 }
 
+// tailHandshake answers OPTIONS on the chat endpoints: what they take, and
+// whether this gateway takes the tail transport.
+//
+// It is how the other end of the transport finds out, before it sends the first
+// request, that its body will be put back together here. Answering it costs
+// nothing and never touches the store, so a client may ask as often as it likes.
+// A gateway with the switch off answers too, without X-Tail-Version: "this is
+// JSON only" is an answer worth having.
+func (s *Server) tailHandshake(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Allow", "POST, OPTIONS")
+	if tailOn() {
+		w.Header().Set(tail.HeaderVersion, tail.Version)
+		w.Header().Set(tail.HeaderBlock, strconv.Itoa(tail.BlockSize))
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// tailCap is what this gateway believes about one provider's far end.
+//
+// Zero state is "not asked yet": the first request over a tail=on provider pays
+// one OPTIONS for the answer, and every turn after it is free. A "no" is asked
+// again after tailProbeAgain, so a far end upgraded later is picked up without
+// restarting anything.
+type tailCap struct {
+	mu    sync.Mutex // one probe at a time per provider, not one per process
+	state atomic.Int32
+	again atomic.Int64 // unix nano before which a "no" is not asked again
+}
+
+const (
+	tailCapUnknown int32 = iota
+	tailCapTakes
+	tailCapDoesNot
+)
+
+func (c *tailCap) takes() bool { return c.state.Load() == tailCapTakes }
+
+// tailProbe asks a far end whether it takes the tail transport: an OPTIONS on
+// the exact URL this gateway would POST to, so no path anybody has to implement
+// is invented for it.
+//
+// Only an answer that names the version and the block size it speaks counts.
+// Anything else — a 405 from a server without OPTIONS, a 404, a proxy answering
+// the request itself, a version or block size that differs, no answer at all —
+// is "it doesn't take it", which sends the request whole, as it went before.
+func (s *Server) tailProbe(ctx context.Context, p provider.Provider) bool {
+	url := strings.TrimRight(p.Base(provider.Chat), "/") + "/chat/completions"
+	ctx, cancel := context.WithTimeout(ctx, tailProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, url, nil)
+	if err != nil {
+		return false
+	}
+	res, err := s.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		return false
+	}
+	if strings.TrimSpace(res.Header.Get(tail.HeaderVersion)) != tail.Version {
+		return false
+	}
+	if got := strings.TrimSpace(res.Header.Get(tail.HeaderBlock)); got != strconv.Itoa(tail.BlockSize) {
+		return false
+	}
+	return true
+}
+
+// tailCapable answers whether a provider's far end takes the tail transport,
+// asking it the first time and whenever a "no" has expired.
+//
+// The answer is per provider, in this process: a prefix a client may name means
+// something only to the endpoint that answered.
+func (s *Server) tailCapable(ctx context.Context, p provider.Provider) bool {
+	if !p.Tail {
+		return false
+	}
+	v, _ := s.tailCaps.LoadOrStore(p.ID, &tailCap{})
+	c := v.(*tailCap)
+	switch c.state.Load() {
+	case tailCapTakes:
+		return true
+	case tailCapDoesNot:
+		if time.Now().UnixNano() < c.again.Load() {
+			return false
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// asked again under the lock: the turn that waited reads the answer the
+	// first one got instead of asking twice
+	switch c.state.Load() {
+	case tailCapTakes:
+		return true
+	case tailCapDoesNot:
+		if time.Now().UnixNano() < c.again.Load() {
+			return false
+		}
+	}
+	if s.tailProbe(ctx, p) {
+		c.state.Store(tailCapTakes)
+		return true
+	}
+	c.state.Store(tailCapDoesNot)
+	c.again.Store(time.Now().Add(tailProbeAgain).UnixNano())
+	return false
+}
+
+// tailForget marks a provider's far end as not taking the transport, for a far
+// end that said it did and then answered as if it didn't (it was replaced, or
+// something between the two answered the handshake).
+func (s *Server) tailForget(p provider.Provider) {
+	v, _ := s.tailCaps.LoadOrStore(p.ID, &tailCap{})
+	c := v.(*tailCap)
+	c.state.Store(tailCapDoesNot)
+	c.again.Store(time.Now().Add(tailProbeAgain).UnixNano())
+}
+
+// tailNotJSON is what a far end says when it was handed a tail body but read a
+// JSON one. It is the only way to recognise "this endpoint doesn't take it" from
+// an ordinary refusal of the request, which must not cost a second request.
+var tailNotJSON = lazyre.New(`(?i)(invalid|expected|malformed|unexpected|parse[d]?|decode)[^.:;]{0,60}(json|content[- ]?type|media[- ]?type)`)
+
+// tailFallback asks the whole request once more when a far end that said it
+// takes the transport answered as if it didn't.
+//
+// The handshake is what keeps this rare: it only happens when the far end
+// changed under a running gateway, or when something between the two answered
+// the OPTIONS itself. The reply is read first — a plain refusal of the request
+// (a content policy, a bad tool pair) passes through untouched, so a payload
+// error never costs a second request and never disables the transport.
+func (s *Server) tailFallback(ctx context.Context, p provider.Provider, to provider.Protocol,
+	path string, body []byte, in http.Header, res *http.Response) (*http.Response, error) {
+	if to != provider.Chat || !p.Tail || res.StatusCode < 400 {
+		return res, nil
+	}
+	v, ok := s.tailCaps.Load(p.ID)
+	if !ok || !v.(*tailCap).takes() {
+		return res, nil
+	}
+	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+	res.Body.Close()
+	res.Body = io.NopCloser(bytes.NewReader(b))
+	switch res.StatusCode {
+	case http.StatusUnsupportedMediaType:
+		// nothing else means "not this content type"
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		if !tailNotJSON.Match(b) {
+			return res, nil
+		}
+	default:
+		return res, nil
+	}
+	s.tailForget(p)
+	plain := p
+	plain.Tail = false
+	return s.forwardOnce(ctx, plain, to, path, body, in)
+}
+
 // tailOut rewrites req to carry only the bytes the far end doesn't hold, for a
 // provider whose requests go over the tail transport. It returns nil — and
 // leaves req exactly as it was — for every request that isn't one: another
@@ -122,6 +304,11 @@ func (s *Server) tailClientFor(p provider.Provider) *tail.Client {
 // can't render.
 func (s *Server) tailOut(req *http.Request, p provider.Provider, to provider.Protocol, body []byte) *tailSent {
 	if to != provider.Chat || !p.Tail || req.Header.Get("Content-Encoding") != "" {
+		return nil
+	}
+	// a body that isn't JSON is only safe where the far end said it takes one:
+	// asked before the first tail goes out, never assumed (tailProbe)
+	if !s.tailCapable(req.Context(), p) {
 		return nil
 	}
 	cl := s.tailClientFor(p)

@@ -52,16 +52,31 @@ func tailPayload(t *testing.T, model string, msgs []map[string]any) []byte {
 // tailUpstream answers Chat as a short SSE reply, keeps what it was sent, and —
 // when asked to speak the tail transport itself — puts a tail back together the
 // way the far end of a real one does.
+// tailHandshake is how a test's far end answers the OPTIONS the egress asks
+// before it sends a body that isn't JSON (tailProbe).
+type tailHandshake int
+
+const (
+	peerTakes      tailHandshake = iota // 204 + version + block: it takes the transport
+	peerNoOptions                       // 405: a server that has no OPTIONS on the path
+	peerWrongBlock                      // 204 + another block size: never a hit
+	peerVersion2                        // 204 + an older version
+)
+
 type tailUpstream struct {
-	mu       sync.Mutex
-	types    []string
-	bodies   []string
-	decoded  []string
-	srv      *tail.Server
-	refuse   bool // answer the first request that names a prefix with a 409
-	refused  int
-	lost     int // prefixes the store truly did not hold (a restart, not a test flag)
-	requests int
+	mu         sync.Mutex
+	handshake  tailHandshake
+	methods    []string
+	refuseTail string // answer a tail with a 400 saying this
+	refuseAll  string // answer every POST with a 400 saying this
+	types      []string
+	bodies     []string
+	decoded    []string
+	srv        *tail.Server
+	refuse     bool // answer the first request that names a prefix with a 409
+	refused    int
+	lost       int // prefixes the store truly did not hold (a restart, not a test flag)
+	requests   int
 }
 
 func (u *tailUpstream) last(t *testing.T) (contentType, body, decoded string) {
@@ -73,6 +88,13 @@ func (u *tailUpstream) last(t *testing.T) (contentType, body, decoded string) {
 	}
 	i := len(u.bodies) - 1
 	return u.types[i], u.bodies[i], u.decoded[i]
+}
+
+// seen returns the methods the far end was asked with, in order.
+func (u *tailUpstream) seen() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.methods...)
 }
 
 func (u *tailUpstream) count() int {
@@ -95,7 +117,40 @@ func newTailUpstream(t *testing.T) (*tailUpstream, string) {
 		ct := r.Header.Get("Content-Type")
 		u.mu.Lock()
 		u.requests++
+		u.methods = append(u.methods, r.Method)
+		hs, refuseTail, refuseAll := u.handshake, u.refuseTail, u.refuseAll
 		u.mu.Unlock()
+
+		if r.Method == http.MethodOptions {
+			switch hs {
+			case peerNoOptions:
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			case peerWrongBlock:
+				w.Header().Set(tail.HeaderVersion, tail.Version)
+				w.Header().Set(tail.HeaderBlock, "1024")
+				w.WriteHeader(http.StatusNoContent)
+			case peerVersion2:
+				w.Header().Set(tail.HeaderVersion, "2")
+				w.Header().Set(tail.HeaderBlock, "512")
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				w.Header().Set("Allow", "POST, OPTIONS")
+				w.Header().Set(tail.HeaderVersion, tail.Version)
+				w.Header().Set(tail.HeaderBlock, "512")
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return
+		}
+		if refuseAll != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":{"message":%q}}`, refuseAll)
+			return
+		}
+		if refuseTail != "" && tail.IsContentType(ct) {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":{"message":%q}}`, refuseTail)
+			return
+		}
 
 		decoded := string(b)
 		if tail.IsContentType(ct) {
@@ -549,5 +604,229 @@ func TestTailRecoversAfterTheFarEndStartsWithNothing(t *testing.T) {
 			len(body), len(third))
 	} else if !strings.Contains(decoded, "会话0第3问") {
 		t.Fatalf("the recovered turn is missing its own messages: %s", decoded)
+	}
+}
+
+// TestTailHandshakeSaysWhatTheEndpointTakes: OPTIONS on the chat path is the
+// handshake, and it says both things a client needs — that this endpoint is
+// there, and whether a body that isn't JSON will be put back together.
+func TestTailHandshakeSaysWhatTheEndpointTakes(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	ask := func(t *testing.T, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, path, nil)
+		New().Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// the switch off: an answer, without claiming a transport it doesn't have
+	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
+		rec := ask(t, path)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS %s with the switch off: %d", path, rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); !strings.Contains(got, "POST") {
+			t.Fatalf("OPTIONS %s: Allow %q doesn't name POST", path, got)
+		}
+		if v := rec.Header().Get(tail.HeaderVersion); v != "" {
+			t.Fatalf("OPTIONS %s claimed version %q with the switch off", path, v)
+		}
+	}
+
+	t.Setenv(TailEnv, "1")
+	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
+		rec := ask(t, path)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS %s: %d", path, rec.Code)
+		}
+		if got := rec.Header().Get(tail.HeaderVersion); got != tail.Version {
+			t.Fatalf("OPTIONS %s said version %q, want %q", path, got, tail.Version)
+		}
+		if got, want := rec.Header().Get(tail.HeaderBlock), "512"; got != want {
+			t.Fatalf("OPTIONS %s said block %q, want %q", path, got, want)
+		}
+	}
+}
+
+// TestTailProviderAsksBeforeItSends: a tail=on provider asks the far end whether
+// it takes the transport before the first body goes out — so the very first turn
+// already goes as a tail, instead of a body that isn't JSON being sent and
+// refused.
+func TestTailProviderAsksBeforeItSends(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t) // answers the handshake as a far end that takes it
+	tailRegisters(t, url, true)
+
+	srv := New()
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", tailSessionTurn(0, 1)))); rec.Code != 200 {
+		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
+	}
+	asked := u.seen()
+	if len(asked) < 2 || asked[0] != http.MethodOptions {
+		t.Fatalf("the far end was asked %v, want the handshake first", asked)
+	}
+	if asked[1] != http.MethodPost {
+		t.Fatalf("the handshake was followed by %q, want the turn", asked[1])
+	}
+	u.mu.Lock()
+	types := append([]string(nil), u.types...)
+	u.mu.Unlock()
+	if len(types) == 0 || !tail.IsContentType(types[0]) {
+		t.Fatalf("the first turn went as %v: it must already be the tail transport", types)
+	}
+	// and it was put back together at the far end, not just refused
+	if _, _, decoded := u.last(t); !strings.Contains(decoded, "会话0第1问") {
+		t.Fatalf("the far end did not put the request together: %s", decoded)
+	}
+}
+
+// TestTailProviderStaysPlainWithoutAHandshake: where the handshake isn't
+// answered — no OPTIONS on the path, another version, another block size — no
+// tail is ever sent. Every turn goes as the JSON it always was, and succeeds.
+func TestTailProviderStaysPlainWithoutAHandshake(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hs   tailHandshake
+	}{
+		{"no options on the path", peerNoOptions},
+		{"another version", peerVersion2},
+		{"another block size", peerWrongBlock},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			u, url := newTailUpstream(t)
+			u.mu.Lock()
+			u.handshake = tc.hs
+			u.mu.Unlock()
+			tailRegisters(t, url, true)
+
+			srv := New()
+			msgs := tailSessionTurn(0, 1)
+			for turn := 1; turn <= 2; turn++ {
+				if turn > 1 {
+					msgs = tailSessionTurn(0, turn)
+				}
+				if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+					t.Fatalf("turn %d: %d %s", turn, rec.Code, rec.Body.String())
+				}
+			}
+			for _, ct := range u.types {
+				if tail.IsContentType(ct) {
+					t.Fatalf("a tail went to a far end that didn't say it takes one (%v)", u.types)
+				}
+			}
+			// the handshake was asked once, not once per turn
+			options := 0
+			for _, m := range u.seen() {
+				if m == http.MethodOptions {
+					options++
+				}
+			}
+			if options != 1 {
+				t.Fatalf("the handshake was asked %d times over two turns, want once", options)
+			}
+		})
+	}
+}
+
+// TestTailFallbackWhenTheFarEndChanges: a far end that answered the handshake
+// and then answers a tail as if it didn't take one — it was replaced under the
+// running gateway. The turn is still served (the whole request once more, as
+// plain JSON), and no further tail is sent until it is asked again.
+func TestTailFallbackWhenTheFarEndChanges(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	tailRegisters(t, url, true)
+
+	srv := New()
+	msgs := tailSessionTurn(0, 1)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// the far end is replaced: it still answers the handshake (a different
+	// program on the same address), but a tail body it now reads as JSON
+	u.mu.Lock()
+	u.refuseTail = "invalid request: expected a JSON object"
+	u.mu.Unlock()
+
+	msgs = tailSessionTurn(0, 2)
+	second := tailPayload(t, "peer/m", msgs)
+	rec := chatAsk(t, srv, string(second))
+	if rec.Code != 200 {
+		t.Fatalf("the turn over a replaced far end: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, _, decoded := u.last(t); !strings.Contains(decoded, "会话0第2问") {
+		t.Fatalf("the retried request is missing this turn: %s", decoded)
+	}
+
+	// and the next turn does not try the transport again
+	u.mu.Lock()
+	u.refuseTail = ""
+	u.mu.Unlock()
+	u.mu.Lock()
+	before := len(u.types) // types records POSTs alone; count() counts the handshake too
+	u.mu.Unlock()
+	msgs = tailSessionTurn(0, 3)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("turn after the fallback: %d %s", rec.Code, rec.Body.String())
+	}
+	u.mu.Lock()
+	types := append([]string(nil), u.types[before:]...)
+	u.mu.Unlock()
+	for _, ct := range types {
+		if tail.IsContentType(ct) {
+			t.Fatalf("a tail was sent again after the fallback (%v)", types)
+		}
+	}
+}
+
+// TestTailFallbackLeavesAPayloadRefusal: an ordinary refusal of the request — not
+// a refusal of the encoding — is passed on as it came, costing neither a second
+// request nor the transport.
+func TestTailFallbackLeavesAPayloadRefusal(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	u.mu.Lock()
+	u.refuseAll = "content policy violation"
+	u.mu.Unlock()
+	tailRegisters(t, url, true)
+
+	srv := New()
+	msgs := tailSessionTurn(0, 1)
+	rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a refused request: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "content policy") {
+		t.Fatalf("the refusal came back as %q", rec.Body.String())
+	}
+	// the refusal was not mistaken for a broken transport: one POST, no retry
+	posts := 0
+	for _, m := range u.seen() {
+		if m == http.MethodPost {
+			posts++
+		}
+	}
+	if posts != 1 {
+		t.Fatalf("the request was asked %d times for one refusal, want 1", posts)
+	}
+	// and the transport is still believed in, so the next turn takes it
+	u.mu.Lock()
+	u.refuseAll = ""
+	u.mu.Unlock()
+	msgs = tailSessionTurn(0, 2)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("turn after the refusal: %d %s", rec.Code, rec.Body.String())
+	}
+	if ct, _, _ := u.last(t); !tail.IsContentType(ct) {
+		t.Fatalf("the transport was dropped after an ordinary refusal: %q", ct)
 	}
 }

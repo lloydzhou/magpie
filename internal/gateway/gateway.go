@@ -545,6 +545,9 @@ type Server struct {
 	// tailClients are the credentials each provider's conversations send
 	// over the tail transport, one per provider id (tail_wire.go).
 	tailClients sync.Map
+	// tailCaps is whether each provider's far end takes the tail transport,
+	// one per provider id, answered by an OPTIONS handshake (tail_wire.go).
+	tailCaps sync.Map
 	// ending closes once the gateway stops serving, for a stream with no
 	// end of its own (routeEvents) to end before Shutdown, which would
 	// wait its whole drain for it (streamsEnding)
@@ -1132,6 +1135,10 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("OPTIONS /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("POST /v1/chat/completions", s.handle(provider.Chat))
 	mux.HandleFunc("POST /chat/completions", s.handle(provider.Chat))
+	// the handshake the tail transport's far end answers before it sends a
+	// body that isn't JSON (tail_wire.go)
+	mux.HandleFunc("OPTIONS /v1/chat/completions", s.tailHandshake)
+	mux.HandleFunc("OPTIONS /chat/completions", s.tailHandshake)
 	mux.HandleFunc("POST /v1/responses", s.handle(provider.Responses))
 	mux.HandleFunc("POST /responses", s.handle(provider.Responses))
 	mux.HandleFunc("GET /v1/responses", s.responsesOverHTTP)
@@ -6089,6 +6096,13 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 		// the far end of the tail transport lost the prefix this turn
 		// named: the whole request once more (tail_wire.go)
 		res, err = s.tailRetransmit(ctx, p, to, path, body, in, res)
+	}
+	if err == nil && res.StatusCode >= 400 {
+		// a far end that said it takes the transport answering as if it
+		// didn't (it was replaced): the whole request as plain JSON once
+		// more, and the transport left off until it is asked again
+		// (tail_wire.go)
+		res, err = s.tailFallback(ctx, p, to, path, body, in, res)
 	}
 	if p.PassesErrors() {
 		// its errors are the client's to deal with (errors=pass): asked
