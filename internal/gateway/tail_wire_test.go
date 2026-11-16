@@ -267,14 +267,28 @@ func tailAsk(t *testing.T, s *Server, prep *tail.Prepared) *httptest.ResponseRec
 	return rec
 }
 
-// tailSaves sets a provider up at url and marks it as the tail's far end.
-func tailRegisters(t *testing.T, url string, marked bool) {
+// tailSaves sets a provider up at url: another magpie, whose far end the
+// handshake decides about.
+func tailRegisters(t *testing.T, url string) {
 	t.Helper()
 	p := provider.Provider{ID: "peer", Name: "Peer", Key: "k", Chat: url + "/v1",
-		Models: []string{"m"}, Tail: marked}
+		Models: []string{"m"}}
 	if err := provider.Save(p); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// tailOn turns the tail transport on for the rest of the test, as the built-in
+// plugin's switch does (plugins/tail), and puts it back off after: an off
+// transport is the state every check that isn't about it expects.
+func tailOn(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tail.Serve(tail.Config{
+		CapFresh: 30 * time.Minute,
+		CapAgain: 5 * time.Minute,
+		Probe:    3 * time.Second,
+		Cache:    32 << 20,
+	}))
 }
 
 // A request that carries only the bytes the gateway doesn't hold is put back
@@ -283,9 +297,9 @@ func tailRegisters(t *testing.T, url string, marked bool) {
 func TestTailTurnReachesTheVendorWhole(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	t.Setenv(TailEnv, "1")
+	tailOn(t)
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, false)
+	tailRegisters(t, url)
 
 	srv := New()
 	cl := tail.NewClient()
@@ -337,7 +351,7 @@ func TestTailTurnWithoutTheSwitchIsNoJSON(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, false)
+	tailRegisters(t, url)
 
 	srv := New()
 	cl := tail.NewClient()
@@ -354,14 +368,14 @@ func TestTailTurnWithoutTheSwitchIsNoJSON(t *testing.T) {
 	}
 }
 
-// A provider marked tail=on sends only the bytes the far end doesn't hold: the
-// second turn of a conversation goes up as its own new bytes, and the far end
-// puts the same request back together.
+// With the transport on, the second turn of a conversation goes up as its own new
+// bytes, and the far end puts the same request back together.
 func TestTailProviderSendsOnlyTheTail(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	tailWarm(t, srv, "peer")
@@ -428,9 +442,10 @@ func chatAsk(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
 func TestTailFarEndThatLostThePrefixGetsTheWholeRequest(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
 	setRefusing(u, true)
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	tailWarm(t, srv, "peer")
@@ -521,8 +536,9 @@ func canonicalMessages(t *testing.T, msgs []map[string]any) string {
 func TestTailParallelSessionsDoNotMix(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	const sessions, turns = 4, 3
 	srv := New()
@@ -618,8 +634,9 @@ func TestTailParallelSessionsDoNotMix(t *testing.T) {
 func TestTailRecoversAfterTheFarEndStartsWithNothing(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	tailWarm(t, srv, "peer")
@@ -671,6 +688,69 @@ func TestTailRecoversAfterTheFarEndStartsWithNothing(t *testing.T) {
 	}
 }
 
+// TestTailPanelIsTheOnlySwitch: nothing is set on a provider — the built-in
+// plugin's switch is the whole configuration, and it turns both halves of the
+// transport on at once: this gateway takes tails, and it sends them to the far
+// ends that answer the handshake. Turning it off puts both back on plain JSON,
+// with no provider left saying anything about the transport.
+func TestTailPanelIsTheOnlySwitch(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t) // a far end that takes the transport
+	tailRegisters(t, url)
+
+	srv := New()
+	handshake := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS: %d", rec.Code)
+		}
+		return rec.Header().Get(tail.HeaderVersion)
+	}
+
+	// off: the handshake says JSON only, and a tail has nowhere to go
+	if v := handshake(); v != "" {
+		t.Fatalf("off, the handshake claimed version %q", v)
+	}
+	cl := tail.NewClient()
+	prep, err := cl.Prepare(tailPayload(t, "peer/m", tailTurn(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := tailAsk(t, srv, prep); rec.Code == 200 {
+		t.Fatal("off, a tail was put back together")
+	}
+	if n := u.count(); n != 0 {
+		t.Fatalf("off, %d requests reached the far end", n)
+	}
+
+	// on: the same provider, nothing set on it, both halves work
+	t.Cleanup(tail.Serve(tail.Config{
+		CapFresh: 30 * time.Minute,
+		CapAgain: 5 * time.Minute,
+		Probe:    3 * time.Second,
+		Cache:    32 << 20,
+	}))
+	if v := handshake(); v != tail.Version {
+		t.Fatalf("on, the handshake said version %q", v)
+	}
+	if rec := tailAsk(t, srv, prep); rec.Code != 200 {
+		t.Fatalf("on, a tail was turned away: %d %s", rec.Code, rec.Body.String())
+	}
+	tailWarm(t, srv, "peer")
+	for turn := 1; turn <= 2; turn++ {
+		if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", tailSessionTurn(0, turn)))); rec.Code != 200 {
+			t.Fatalf("turn %d: %d %s", turn, rec.Code, rec.Body.String())
+		}
+	}
+	if ct, _, _ := u.last(t); !tail.IsContentType(ct) {
+		t.Fatalf("on, the second turn went as %q: nothing configured per provider", ct)
+	}
+}
+
 // TestTailHandshakeSaysWhatTheEndpointTakes: OPTIONS on the chat path is the
 // handshake, and it says both things a client needs — that this endpoint is
 // there, and whether a body that isn't JSON will be put back together.
@@ -700,7 +780,13 @@ func TestTailHandshakeSaysWhatTheEndpointTakes(t *testing.T) {
 		}
 	}
 
-	t.Setenv(TailEnv, "1")
+	// the panel on
+	t.Cleanup(tail.Serve(tail.Config{
+		CapFresh: 30 * time.Minute,
+		CapAgain: 5 * time.Minute,
+		Probe:    3 * time.Second,
+		Cache:    32 << 20,
+	}))
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
 		rec := ask(t, path)
 		if rec.Code != http.StatusNoContent {
@@ -715,15 +801,15 @@ func TestTailHandshakeSaysWhatTheEndpointTakes(t *testing.T) {
 	}
 }
 
-// TestTailProviderAsksBeforeItSends: a tail=on provider asks the far end whether
-// it takes the transport before the first body goes out — so the very first turn
-// already goes as a tail, instead of a body that isn't JSON being sent and
-// refused.
+// TestTailProviderAsksBeforeItSends: the handshake is asked before the first tail
+// goes out, so the very first turn already goes as one, instead of a body that
+// isn't JSON being sent and refused.
 func TestTailProviderAsksBeforeItSends(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t) // answers the handshake as a far end that takes it
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	tailWarm(t, srv, "peer")
@@ -764,11 +850,12 @@ func TestTailProviderStaysPlainWithoutAHandshake(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			tailOn(t)
 			u, url := newTailUpstream(t)
 			u.mu.Lock()
 			u.handshake = tc.hs
 			u.mu.Unlock()
-			tailRegisters(t, url, true)
+			tailRegisters(t, url)
 
 			srv := New()
 			msgs := tailSessionTurn(0, 1)
@@ -806,8 +893,9 @@ func TestTailProviderStaysPlainWithoutAHandshake(t *testing.T) {
 func TestTailFallbackWhenTheFarEndChanges(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	tailWarm(t, srv, "peer")
@@ -859,11 +947,12 @@ func TestTailFallbackWhenTheFarEndChanges(t *testing.T) {
 func TestTailFallbackLeavesAPayloadRefusal(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
 	u.mu.Lock()
 	u.refuseAll = "content policy violation"
 	u.mu.Unlock()
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	tailWarm(t, srv, "peer")
@@ -904,11 +993,12 @@ func TestTailFallbackLeavesAPayloadRefusal(t *testing.T) {
 func TestTailTurnNeverWaitsForTheHandshake(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
 	u.mu.Lock()
 	u.handshake = peerSlow // answers an OPTIONS a whole second later
 	u.mu.Unlock()
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	msgs := tailSessionTurn(0, 1)
@@ -950,17 +1040,19 @@ func TestTailTurnNeverWaitsForTheHandshake(t *testing.T) {
 // while, and asked again when that has passed — so it is neither a per-turn cost
 // nor a reason a far end upgraded later is never used.
 func TestTailHandshakeAnswerIsCached(t *testing.T) {
-	oldAgain := tailCapAgain
-	tailCapAgain = 60 * time.Millisecond
-	t.Cleanup(func() { tailCapAgain = oldAgain })
-
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Cleanup(tail.Serve(tail.Config{
+		CapFresh: time.Minute,
+		CapAgain: 60 * time.Millisecond,
+		Probe:    3 * time.Second,
+		Cache:    32 << 20,
+	}))
 	u, url := newTailUpstream(t)
 	u.mu.Lock()
 	u.handshake = peerNoOptions
 	u.mu.Unlock()
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	options := func() int {
 		n := 0
@@ -992,7 +1084,7 @@ func TestTailHandshakeAnswerIsCached(t *testing.T) {
 	u.mu.Lock()
 	u.handshake = peerTakes
 	u.mu.Unlock()
-	time.Sleep(tailCapAgain * 2)
+	time.Sleep(tail.Settings().CapAgain * 2)
 	msgs := tailSessionTurn(0, 4)
 	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
 		t.Fatalf("turn after the upgrade: %d %s", rec.Code, rec.Body.String())
@@ -1029,11 +1121,12 @@ func TestTailEveryUnsupportedAnswerMeansNoTail(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			tailOn(t)
 			u, url := newTailUpstream(t)
 			u.mu.Lock()
 			u.handshake = tc.hs
 			u.mu.Unlock()
-			tailRegisters(t, url, true)
+			tailRegisters(t, url)
 
 			srv := New()
 			for turn := 1; turn <= 2; turn++ {
@@ -1058,8 +1151,9 @@ func TestTailEveryUnsupportedAnswerMeansNoTail(t *testing.T) {
 func TestTailModelsListingAsksTheFarEnds(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	tailOn(t)
 	u, url := newTailUpstream(t)
-	tailRegisters(t, url, true)
+	tailRegisters(t, url)
 
 	srv := New()
 	rec := httptest.NewRecorder()

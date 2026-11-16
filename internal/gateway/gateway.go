@@ -537,11 +537,12 @@ type Call struct {
 // Server is the gateway.
 type Server struct {
 	client *http.Client
-	// tailOnce builds the tail transport's block cache, and tailSrv is it
-	// (tail_wire.go): what requests that came in as a tail are put back
-	// together from.
-	tailOnce sync.Once
-	tailSrv  *tail.Server
+	// tailSrv is the tail transport's block cache, and tailCache the size it
+	// was built with (tail_wire.go): what requests that came in as a tail are
+	// put back together from.
+	tailMu    sync.Mutex
+	tailCache int64
+	tailSrv   *tail.Server
 	// tailClients are the credentials each provider's conversations send
 	// over the tail transport, one per provider id (tail_wire.go).
 	tailClients sync.Map
