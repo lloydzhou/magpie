@@ -44,8 +44,12 @@ func jsonBody(h http.Header, body []byte) bool {
 		if err != nil {
 			mt = strings.ToLower(strings.TrimSpace(ct))
 		}
+		// a tail is put back together byte for byte, so its bytes are not
+		// rewritten as text: one rewritten byte moves every block boundary
+		// after it (tail_wire.go)
 		if strings.HasPrefix(mt, "multipart/") || strings.HasPrefix(mt, "audio/") || strings.HasPrefix(mt, "image/") ||
-			strings.HasPrefix(mt, "video/") || mt == "application/octet-stream" || mt == "application/x-www-form-urlencoded" {
+			strings.HasPrefix(mt, "video/") || mt == "application/octet-stream" || mt == "application/x-www-form-urlencoded" ||
+			mt == "application/x-tail-v3" {
 			return false
 		}
 	}

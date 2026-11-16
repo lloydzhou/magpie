@@ -41,6 +41,7 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/tail"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -536,6 +537,18 @@ type Call struct {
 // Server is the gateway.
 type Server struct {
 	client *http.Client
+	// tailSrv is the tail transport's block cache, and tailCache the size it
+	// was built with (tail_wire.go): what requests that came in as a tail are
+	// put back together from.
+	tailMu    sync.Mutex
+	tailCache int64
+	tailSrv   *tail.Server
+	// tailClients are the credentials each provider's conversations send
+	// over the tail transport, one per provider id (tail_wire.go).
+	tailClients sync.Map
+	// tailCaps is whether each provider's far end takes the tail transport,
+	// one per provider id, answered by an OPTIONS handshake (tail_wire.go).
+	tailCaps sync.Map
 	// ending closes once the gateway stops serving, for a stream with no
 	// end of its own (routeEvents) to end before Shutdown, which would
 	// wait its whole drain for it (streamsEnding)
@@ -1123,6 +1136,10 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("OPTIONS /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("POST /v1/chat/completions", s.handle(provider.Chat))
 	mux.HandleFunc("POST /chat/completions", s.handle(provider.Chat))
+	// the handshake the tail transport's far end answers before it sends a
+	// body that isn't JSON (tail_wire.go)
+	mux.HandleFunc("OPTIONS /v1/chat/completions", s.tailHandshake)
+	mux.HandleFunc("OPTIONS /chat/completions", s.tailHandshake)
 	mux.HandleFunc("POST /v1/responses", s.handle(provider.Responses))
 	mux.HandleFunc("POST /responses", s.handle(provider.Responses))
 	mux.HandleFunc("GET /v1/responses", s.responsesOverHTTP)
@@ -1744,6 +1761,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
+	// the far ends of the tail transport are asked while the list is built
+	// (tailAskAll): an agent lists models before its first turn, so the turn
+	// never waits on the answer and no turn pays for the question
+	s.tailAskAll()
 	data := []map[string]any{}
 	chat, images, videos, err := listKinds(r)
 	if err != nil {
@@ -2268,6 +2289,13 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, ok := s.requestBody(w, r, from)
 		if !ok {
+			return
+		}
+		// a request that came over the tail transport carries only the bytes
+		// this gateway didn't hold: put it back together before anything
+		// reads it (tail_wire.go), and hand on the JSON every stage below
+		// was written for
+		if body, ok = s.tailIngress(w, r, from, body); !ok {
 			return
 		}
 		var err error
@@ -6069,6 +6097,18 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 		// errors setting
 		res, err = s.dsRetryGone(ctx, p, to, path, body, in, res)
 	}
+	if err == nil && res.StatusCode >= 400 {
+		// the far end of the tail transport lost the prefix this turn
+		// named: the whole request once more (tail_wire.go)
+		res, err = s.tailRetransmit(ctx, p, to, path, body, in, res)
+	}
+	if err == nil && res.StatusCode >= 400 {
+		// a far end that said it takes the transport answering as if it
+		// didn't (it was replaced): the whole request as plain JSON once
+		// more, and the transport left off until it is asked again
+		// (tail_wire.go)
+		res, err = s.tailFallback(ctx, p, to, path, body, in, res)
+	}
 	if p.PassesErrors() {
 		// its errors are the client's to deal with (errors=pass): asked
 		// once, never again in another shape
@@ -6460,6 +6500,13 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		// sent plain, ChatGPT answered a 1.1 MB one 503 (ylorn on X)
 		sent = provider.CodexCompressed(req, body)
 	}
+	// a provider whose requests go over the tail transport (tail_wire.go)
+	// takes only the bytes it doesn't hold, so the body on the wire is the
+	// tail of this request and that is what the ledger counts
+	tailed := s.tailOut(req, p, to, body)
+	if tailed != nil {
+		sent = tailed.sent()
+	}
 	// the bytes go on the wire whether the vendor answers or not, counted
 	// for the request's ledger row (#4456)
 	sentUp(ctx, sent, len(body))
@@ -6477,6 +6524,10 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	res, err := p.Do(s.client, req)
 	// what comes back is counted as it is read, as what went is (#4456)
 	res = gotDown(ctx, res)
+	if tailed != nil {
+		// the prefix this turn covered, for the next one to name
+		tailed.settle(res)
+	}
 	if err == nil && res.StatusCode >= 400 && provider.OpenCodeURL(req.URL.String()) {
 		logOpenCodeRefusal(p, req, res.StatusCode)
 	}
