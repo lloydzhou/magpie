@@ -55,8 +55,8 @@ re-alignment plus its own new bytes.
 ## The handshake, and why the body may stop being JSON
 
 Every other request magpie sends is a JSON body. A tail request is not: it is the
-rendered text from some offset on. So before the first one goes out, the egress
-asks the far end what it takes:
+rendered text from some offset on. So before one goes out, the egress has to know
+the far end takes it:
 
 ```
 OPTIONS {the URL the request would POST to}
@@ -66,21 +66,34 @@ OPTIONS {the URL the request would POST to}
 ```
 
 `OPTIONS` on the path the request itself uses, rather than a new endpoint: there
-is nothing new for a far end to implement, and a server that has no OPTIONS, has
-another version, keeps another block size, or answers through a proxy instead of
-the origin simply never gets sent a tail. Its turns are the JSON they always
-were. The block size is in the answer because two implementations that disagree
-on it never hit — the client would name a boundary the peer's chain does not have
-— so it is advertised instead of assumed. A gateway with `MAGPIE_TAIL` off
-answers too, without `X-Tail-Version`: "JSON only" is an answer worth having.
+is nothing new for a far end to implement. The block size is in the answer
+because two implementations that disagree on it never hit — the client would name
+a boundary the peer's chain does not have — so it is advertised instead of
+assumed. A gateway with `MAGPIE_TAIL` off answers too, without `X-Tail-Version`:
+"JSON only" is an answer worth having.
+
+**It is never asked on a turn's way.** Three states, and only one of them sends a
+tail:
+
+| State | What a turn does | How it is left |
+| --- | --- | --- |
+| unknown | **goes whole — plain JSON**, exactly as before this transport existed | a background `OPTIONS` is started, once, and this turn does not wait for it |
+| takes | the tail transport | the answer is believed for `tailCapFresh` (30 min) |
+| does not | **goes whole, always** | believed for `tailCapAgain` (5 min), then asked again |
+
+So the handshake costs a turn no latency at all, and costs a fresh conversation
+nothing it wasn't already paying: its first turn is a full one either way. The
+question is started early anyway — listing models does it (`tailAskAll`), which is
+the one thing an agent does before its first turn — so in practice the answer is
+there before the turn is, and the first turn already goes as a tail.
 
 Two consequences worth stating plainly:
 
 - **Deployment order stops mattering.** The client may be given `tail=on` before
-  the far end is upgraded; it asks, is told no, and sends whole requests until
-  the answer changes. The old failure mode was a first request that wasn't JSON
+  the far end is upgraded; it asks, is told no, and sends whole requests until the
+  answer changes. The old failure mode was a first request that wasn't JSON
   meeting a server that parsed JSON: a 400/415 per turn, counted as an upstream
-  failure.
+  failure — or, worse, a 200 from something that read nothing.
 - **A lying far end costs one retry, not a broken turn.** If it answered the
   handshake and then refused a tail as a body it couldn't read (it was replaced
   under a running gateway), the request goes again as plain JSON, the transport
@@ -110,8 +123,9 @@ Egress, one Chat turn:
 1. `Server.forwardOnce` finalizes the body, then calls `Server.tailOut`. A
    provider without `tail=on`, another protocol, or an encoded body leaves the
    request untouched. So does a far end that has not answered the handshake:
-   `tailOut` asks `tailCapable` first, which probes at most once per provider
-   (and once every few minutes after a "no").
+   `tailOut` asks `tailCapable` first, which answers from cache and never probes
+   on the request's way: an unknown answer means this turn goes whole, and the
+   question is asked in the background.
 2. `tailOut` asks the provider's credential table for a `Prepared` request, sets
    the tail as the request body, `application/x-tail-v3` as the content type and
    the prefix in `X-Tail-Have`. What the ledger counts as sent is the tail's
@@ -126,8 +140,9 @@ Egress, one Chat turn:
 ## State
 
 - **Capability**: per provider, in memory (`Server.tailCaps`), the far end's
-  answer to the handshake and when a "no" may be asked again. Not persisted: a
-  restarted gateway asks again, which is one OPTIONS.
+  answer to the handshake and when that answer goes stale. Not persisted: a
+  restarted gateway asks again, which is one OPTIONS per tail=on provider, off
+  any turn's way.
 - **Client credential table**: per provider, in memory (`Server.tailClients`),
   `session → [(length, tip)]`. A session is the body's own content, so it needs
   no bookkeeping across restarts: a fresh gateway simply misses and gets the

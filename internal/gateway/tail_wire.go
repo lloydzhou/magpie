@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,16 +52,25 @@ const (
 	// are worth less than the memory: 256 MB holds roughly 480 sessions the
 	// size of a large Codex turn.
 	tailCacheBytes = 256 << 20
+)
 
-	// tailProbeTimeout bounds the handshake. It runs inside a request, so it is
-	// shorter than any turn: a far end that cannot answer it in this long is
-	// treated as not taking the transport, which is always the safe answer.
+// How long the handshake is given, and how long its answers are believed.
+//
+// All variables so the tests can make them short.
+var (
+	// tailProbeTimeout bounds the question, which is asked off every turn's
+	// way. Nothing a request does waits for it; its answer is what the next
+	// turn reads, so a far end that never answers costs one turn, not a
+	// goroutine per request.
 	tailProbeTimeout = 3 * time.Second
-
-	// tailProbeAgain is how long "it doesn't take it" is believed before it is
-	// asked again. Long enough not to pay a probe per turn, short enough that a
-	// far end upgraded at noon is used before the afternoon is over.
-	tailProbeAgain = 5 * time.Minute
+	// tailCapFresh: this far end takes the transport. Believed this long, then
+	// asked again — which picks up a far end downgraded under a running
+	// gateway without waiting for a turn to be refused.
+	tailCapFresh = 30 * time.Minute
+	// tailCapAgain: it doesn't. Asked again sooner — an endpoint upgraded this
+	// morning should be used this afternoon — but nowhere near often enough to
+	// be a probe per turn.
+	tailCapAgain = 5 * time.Minute
 )
 
 // tailIngress puts a request's body back together when it came over the tail
@@ -155,14 +163,13 @@ func (s *Server) tailHandshake(w http.ResponseWriter, r *http.Request) {
 
 // tailCap is what this gateway believes about one provider's far end.
 //
-// Zero state is "not asked yet": the first request over a tail=on provider pays
-// one OPTIONS for the answer, and every turn after it is free. A "no" is asked
-// again after tailProbeAgain, so a far end upgraded later is picked up without
-// restarting anything.
+// Both answers go stale: a "no" is asked again sooner, because an endpoint that
+// was upgraded is worth finding out about, and a "yes" later, because one that
+// was replaced is caught by its own refusal anyway (tailFallback).
 type tailCap struct {
-	mu    sync.Mutex // one probe at a time per provider, not one per process
-	state atomic.Int32
-	again atomic.Int64 // unix nano before which a "no" is not asked again
+	state  atomic.Int32
+	until  atomic.Int64 // unix nano: when this answer stops being believed
+	asking atomic.Bool  // the background question is in flight; one is enough
 }
 
 const (
@@ -171,89 +178,151 @@ const (
 	tailCapDoesNot
 )
 
-func (c *tailCap) takes() bool { return c.state.Load() == tailCapTakes }
-
-// tailProbe asks a far end whether it takes the tail transport: an OPTIONS on
-// the exact URL this gateway would POST to, so no path anybody has to implement
-// is invented for it.
-//
-// Only an answer that names the version and the block size it speaks counts.
-// Anything else — a 405 from a server without OPTIONS, a 404, a proxy answering
-// the request itself, a version or block size that differs, no answer at all —
-// is "it doesn't take it", which sends the request whole, as it went before.
-func (s *Server) tailProbe(ctx context.Context, p provider.Provider) bool {
-	url := strings.TrimRight(p.Base(provider.Chat), "/") + "/chat/completions"
-	ctx, cancel := context.WithTimeout(ctx, tailProbeTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, url, nil)
-	if err != nil {
-		return false
-	}
-	res, err := s.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 400 {
-		return false
-	}
-	if strings.TrimSpace(res.Header.Get(tail.HeaderVersion)) != tail.Version {
-		return false
-	}
-	if got := strings.TrimSpace(res.Header.Get(tail.HeaderBlock)); got != strconv.Itoa(tail.BlockSize) {
-		return false
-	}
-	return true
+// takes reports whether the far end is believed to take the transport.
+func (c *tailCap) takes() bool {
+	return c.state.Load() == tailCapTakes && time.Now().UnixNano() < c.until.Load()
 }
 
-// tailCapable answers whether a provider's far end takes the tail transport,
-// asking it the first time and whenever a "no" has expired.
+// refuses reports whether a "no" is still fresh. An unknown answer is not one:
+// it is a question to ask, not an answer to cache.
+func (c *tailCap) refuses() bool {
+	return c.state.Load() == tailCapDoesNot && time.Now().UnixNano() < c.until.Load()
+}
+
+// set records one answer to the handshake.
+func (c *tailCap) set(takes bool) {
+	if takes {
+		c.state.Store(tailCapTakes)
+		c.until.Store(time.Now().Add(tailCapFresh).UnixNano())
+		return
+	}
+	c.state.Store(tailCapDoesNot)
+	c.until.Store(time.Now().Add(tailCapAgain).UnixNano())
+}
+
+// tailProbeOnce asks a far end whether it takes the tail transport: an OPTIONS
+// on the exact URL this gateway would POST to, so no path anybody has to
+// implement is invented for it.
+//
+// It returns two things on purpose. takes is what the far end said; answered is
+// whether it said anything at all. A server that never answers the OPTIONS is not
+// the same as one that answers "no": the first is asked again, the second is
+// believed for a while.
+//
+// Anything the far end does answer with counts as "no" unless it names the
+// version and the block size it speaks — every way a server can be unable to
+// take this transport: a 405 or a 501 from one that serves POST alone, a 404 from
+// one that routes nothing else, a 401 behind something that wants a sign-in, a
+// 200 from a proxy that never asked the origin, and a header that names another
+// version or another block size. Being wrong in this direction costs the saving;
+// being wrong in the other costs the turn.
+func (s *Server) tailProbeOnce(ctx context.Context, p provider.Provider) (takes, answered bool) {
+	url := strings.TrimRight(p.Base(provider.Chat), "/") + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, url, nil)
+	if err != nil {
+		return false, false
+	}
+	req.Header.Set("Accept", "*/*")
+	res, err := s.client.Do(req)
+	if err != nil {
+		return false, false
+	}
+	defer res.Body.Close()
+	// the body is never read: the answer is in the headers, and a big one (an
+	// HTML error page) is not worth waiting for
+	if res.StatusCode >= 400 {
+		return false, true
+	}
+	if strings.TrimSpace(res.Header.Get(tail.HeaderVersion)) != tail.Version {
+		return false, true
+	}
+	if strings.TrimSpace(res.Header.Get(tail.HeaderBlock)) != strconv.Itoa(tail.BlockSize) {
+		return false, true
+	}
+	return true, true
+}
+
+// tailCapable answers whether a provider's far end takes the tail transport.
+//
+// It never asks on the request's way. An answer that isn't known yet means this
+// turn goes whole — plain JSON, the request as it went before this transport
+// existed — and the question is asked in the background: one OPTIONS, bounded,
+// whose answer is then good for tailCapFresh or tailCapAgain. So the handshake
+// costs no turn any latency, ever, and the only thing a fresh conversation pays
+// is that its first turn is a full one, which is what it costs anyway.
+//
+// Listing models starts the question (tailAskAll), which is the one thing an
+// agent does before its first turn: in practice the answer is there before the
+// turn is, and the first turn already goes as a tail.
 //
 // The answer is per provider, in this process: a prefix a client may name means
 // something only to the endpoint that answered.
-func (s *Server) tailCapable(ctx context.Context, p provider.Provider) bool {
+func (s *Server) tailCapable(p provider.Provider) bool {
 	if !p.Tail {
 		return false
 	}
 	v, _ := s.tailCaps.LoadOrStore(p.ID, &tailCap{})
 	c := v.(*tailCap)
-	switch c.state.Load() {
-	case tailCapTakes:
-		return true
-	case tailCapDoesNot:
-		if time.Now().UnixNano() < c.again.Load() {
-			return false
-		}
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// asked again under the lock: the turn that waited reads the answer the
-	// first one got instead of asking twice
-	switch c.state.Load() {
-	case tailCapTakes:
-		return true
-	case tailCapDoesNot:
-		if time.Now().UnixNano() < c.again.Load() {
-			return false
-		}
-	}
-	if s.tailProbe(ctx, p) {
-		c.state.Store(tailCapTakes)
+	if c.takes() {
 		return true
 	}
-	c.state.Store(tailCapDoesNot)
-	c.again.Store(time.Now().Add(tailProbeAgain).UnixNano())
+	if c.refuses() {
+		return false
+	}
+	// unknown: this turn goes whole, and the question is asked off its way
+	s.tailAskLater(p, c)
 	return false
+}
+
+// tailAskLater asks the far end in the background, once: the turn that found the
+// answer unknown started the question and went on without it.
+func (s *Server) tailAskLater(p provider.Provider, c *tailCap) {
+	if !c.asking.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer c.asking.Store(false)
+		// not the request's context: the turn that started this is over
+		ctx, cancel := context.WithTimeout(context.Background(), tailProbeTimeout)
+		defer cancel()
+		takes, answered := s.tailProbeOnce(ctx, p)
+		if !answered {
+			// nothing at all before the timeout: a no, so the next turns
+			// don't each wait one out
+			takes = false
+		}
+		c.set(takes)
+	}()
+}
+
+// tailAskAll asks every far end the tail transport is switched on for, off a
+// request's way.
+//
+// It runs while the model list is being built, which is the one thing an agent
+// does before its first turn: the answer is ready by then, without a turn ever
+// waiting on it and without a probe per turn.
+func (s *Server) tailAskAll() {
+	for _, p := range provider.All() {
+		if !p.Tail || !p.On() {
+			continue
+		}
+		v, _ := s.tailCaps.LoadOrStore(p.ID, &tailCap{})
+		c := v.(*tailCap)
+		if !c.takes() {
+			s.tailAskLater(p, c)
+		}
+	}
 }
 
 // tailForget marks a provider's far end as not taking the transport, for a far
 // end that said it did and then answered as if it didn't (it was replaced, or
-// something between the two answered the handshake).
+// something between the two answered the handshake). It is asked again after
+// tailCapAgain.
 func (s *Server) tailForget(p provider.Provider) {
 	v, _ := s.tailCaps.LoadOrStore(p.ID, &tailCap{})
 	c := v.(*tailCap)
 	c.state.Store(tailCapDoesNot)
-	c.again.Store(time.Now().Add(tailProbeAgain).UnixNano())
+	c.until.Store(time.Now().Add(tailCapAgain).UnixNano())
 }
 
 // tailNotJSON is what a far end says when it was handed a tail body but read a
@@ -308,7 +377,7 @@ func (s *Server) tailOut(req *http.Request, p provider.Provider, to provider.Pro
 	}
 	// a body that isn't JSON is only safe where the far end said it takes one:
 	// asked before the first tail goes out, never assumed (tailProbe)
-	if !s.tailCapable(req.Context(), p) {
+	if !s.tailCapable(p) {
 		return nil
 	}
 	cl := s.tailClientFor(p)

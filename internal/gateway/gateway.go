@@ -1760,6 +1760,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
+	// the far ends of the tail transport are asked while the list is built
+	// (tailAskAll): an agent lists models before its first turn, so the turn
+	// never waits on the answer and no turn pays for the question
+	s.tailAskAll()
 	data := []map[string]any{}
 	chat, images, videos, err := listKinds(r)
 	if err != nil {

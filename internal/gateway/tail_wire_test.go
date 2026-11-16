@@ -9,11 +9,55 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/tail"
 )
+
+// tailCapWait waits until the background handshake has taken it, the way an
+// agent's model listing does before its first turn.
+func tailCapWait(t *testing.T, s *Server, id string) bool {
+	t.Helper()
+	return tailCapSettled(t, s, id, func(c *tailCap) bool { return c.takes() })
+}
+
+// tailCapKnown waits until the handshake has been answered either way.
+func tailCapKnown(t *testing.T, s *Server, id string) bool {
+	t.Helper()
+	return tailCapSettled(t, s, id, func(c *tailCap) bool {
+		return c.takes() || c.refuses()
+	})
+}
+
+func tailCapSettled(t *testing.T, s *Server, id string, done func(*tailCap) bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok := s.tailCaps.Load(id); ok && v.(*tailCap) != nil && done(v.(*tailCap)) {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+// tailWarm lists the models, as an agent does before its first turn, and waits
+// for the handshake that listing starts.
+func tailWarm(t *testing.T, s *Server, id string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+Token)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("listing models: %d %s", rec.Code, rec.Body.String())
+	}
+	if !tailCapWait(t, s, id) {
+		t.Fatal("the handshake was never answered")
+	}
+}
 
 // tailTurn is one agent turn: a long system prompt, a few tool definitions and
 // the history so far — the shape whose upload the tail transport is for.
@@ -57,10 +101,14 @@ func tailPayload(t *testing.T, model string, msgs []map[string]any) []byte {
 type tailHandshake int
 
 const (
-	peerTakes      tailHandshake = iota // 204 + version + block: it takes the transport
-	peerNoOptions                       // 405: a server that has no OPTIONS on the path
-	peerWrongBlock                      // 204 + another block size: never a hit
-	peerVersion2                        // 204 + an older version
+	peerTakes        tailHandshake = iota // 204 + version + block: it takes the transport
+	peerNoOptions                         // 405: a server that has no OPTIONS on the path
+	peerNotFound                          // 404: it routes nothing else
+	peerUnauthorized                      // 401: everything behind a sign-in
+	peerOKNoHeaders                       // 200 with an HTML page: not a tail far end
+	peerSlow                              // answers an OPTIONS a second later
+	peerWrongBlock                        // 204 + another block size: never a hit
+	peerVersion2                          // 204 + an older version
 )
 
 type tailUpstream struct {
@@ -128,6 +176,18 @@ func newTailUpstream(t *testing.T) (*tailUpstream, string) {
 			case peerWrongBlock:
 				w.Header().Set(tail.HeaderVersion, tail.Version)
 				w.Header().Set(tail.HeaderBlock, "1024")
+				w.WriteHeader(http.StatusNoContent)
+			case peerNotFound:
+				http.NotFound(w, r)
+			case peerUnauthorized:
+				w.WriteHeader(http.StatusUnauthorized)
+			case peerOKNoHeaders:
+				w.Header().Set("Content-Type", "text/html")
+				io.WriteString(w, "<html><body>hello</body></html>")
+			case peerSlow:
+				time.Sleep(time.Second)
+				w.Header().Set(tail.HeaderVersion, tail.Version)
+				w.Header().Set(tail.HeaderBlock, "512")
 				w.WriteHeader(http.StatusNoContent)
 			case peerVersion2:
 				w.Header().Set(tail.HeaderVersion, "2")
@@ -304,6 +364,7 @@ func TestTailProviderSendsOnlyTheTail(t *testing.T) {
 	tailRegisters(t, url, true)
 
 	srv := New()
+	tailWarm(t, srv, "peer")
 	msgs := tailTurn(2)
 	first := tailPayload(t, "peer/m", msgs)
 	if rec := chatAsk(t, srv, string(first)); rec.Code != 200 {
@@ -372,6 +433,7 @@ func TestTailFarEndThatLostThePrefixGetsTheWholeRequest(t *testing.T) {
 	tailRegisters(t, url, true)
 
 	srv := New()
+	tailWarm(t, srv, "peer")
 	msgs := tailTurn(2)
 	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
 		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
@@ -464,6 +526,7 @@ func TestTailParallelSessionsDoNotMix(t *testing.T) {
 
 	const sessions, turns = 4, 3
 	srv := New()
+	tailWarm(t, srv, "peer")
 
 	// Every payload is built before anything is sent: the far end must see
 	// exactly these histories, in any order.
@@ -559,6 +622,7 @@ func TestTailRecoversAfterTheFarEndStartsWithNothing(t *testing.T) {
 	tailRegisters(t, url, true)
 
 	srv := New()
+	tailWarm(t, srv, "peer")
 	msgs := tailSessionTurn(0, 1)
 	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
 		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
@@ -662,6 +726,7 @@ func TestTailProviderAsksBeforeItSends(t *testing.T) {
 	tailRegisters(t, url, true)
 
 	srv := New()
+	tailWarm(t, srv, "peer")
 	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", tailSessionTurn(0, 1)))); rec.Code != 200 {
 		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
 	}
@@ -745,6 +810,7 @@ func TestTailFallbackWhenTheFarEndChanges(t *testing.T) {
 	tailRegisters(t, url, true)
 
 	srv := New()
+	tailWarm(t, srv, "peer")
 	msgs := tailSessionTurn(0, 1)
 	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
 		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
@@ -800,6 +866,7 @@ func TestTailFallbackLeavesAPayloadRefusal(t *testing.T) {
 	tailRegisters(t, url, true)
 
 	srv := New()
+	tailWarm(t, srv, "peer")
 	msgs := tailSessionTurn(0, 1)
 	rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs)))
 	if rec.Code != http.StatusBadRequest {
@@ -828,5 +895,191 @@ func TestTailFallbackLeavesAPayloadRefusal(t *testing.T) {
 	}
 	if ct, _, _ := u.last(t); !tail.IsContentType(ct) {
 		t.Fatalf("the transport was dropped after an ordinary refusal: %q", ct)
+	}
+}
+
+// TestTailTurnNeverWaitsForTheHandshake: the question is asked off the turn's
+// way, so a far end that is slow to answer it costs the turn nothing at all —
+// not a timeout, not a round trip.
+func TestTailTurnNeverWaitsForTheHandshake(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	u.mu.Lock()
+	u.handshake = peerSlow // answers an OPTIONS a whole second later
+	u.mu.Unlock()
+	tailRegisters(t, url, true)
+
+	srv := New()
+	msgs := tailSessionTurn(0, 1)
+	started := time.Now()
+	rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs)))
+	elapsed := time.Since(started)
+	if rec.Code != 200 {
+		t.Fatalf("first turn: %d %s", rec.Code, rec.Body.String())
+	}
+	// the far end holds the handshake for a whole second; the turn must not
+	// be anywhere near that
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("the first turn waited %s on the handshake", elapsed.Round(time.Millisecond))
+	}
+	u.mu.Lock()
+	first := append([]string(nil), u.types...)
+	u.mu.Unlock()
+	if len(first) == 0 {
+		t.Fatal("nothing was sent")
+	}
+	if tail.IsContentType(first[0]) {
+		t.Fatal("a tail was sent before the handshake could be answered")
+	}
+
+	// the question finishes off the turn's way, and the next turn reads it
+	if !tailCapWait(t, srv, "peer") {
+		t.Fatal("the handshake was never finished")
+	}
+	msgs = tailSessionTurn(0, 2)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("second turn: %d %s", rec.Code, rec.Body.String())
+	}
+	if ct, _, _ := u.last(t); !tail.IsContentType(ct) {
+		t.Fatalf("the second turn went as %q: the handshake's answer wasn't used", ct)
+	}
+}
+
+// TestTailHandshakeAnswerIsCached: the question is asked once, believed for a
+// while, and asked again when that has passed — so it is neither a per-turn cost
+// nor a reason a far end upgraded later is never used.
+func TestTailHandshakeAnswerIsCached(t *testing.T) {
+	oldAgain := tailCapAgain
+	tailCapAgain = 60 * time.Millisecond
+	t.Cleanup(func() { tailCapAgain = oldAgain })
+
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	u.mu.Lock()
+	u.handshake = peerNoOptions
+	u.mu.Unlock()
+	tailRegisters(t, url, true)
+
+	options := func() int {
+		n := 0
+		for _, m := range u.seen() {
+			if m == http.MethodOptions {
+				n++
+			}
+		}
+		return n
+	}
+
+	srv := New()
+	for turn := 1; turn <= 3; turn++ {
+		msgs := tailSessionTurn(0, turn)
+		if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+			t.Fatalf("turn %d: %d %s", turn, rec.Code, rec.Body.String())
+		}
+	}
+	if !tailCapKnown(t, srv, "peer") {
+		t.Fatal("the handshake was never answered")
+	}
+	if got := options(); got != 1 {
+		t.Fatalf("three turns asked the handshake %d times, want once", got)
+	}
+
+	// the far end is upgraded; once the answer goes stale it is asked again.
+	// The turn that finds it stale goes whole — the answer isn't known yet —
+	// and the one after it reads the new one.
+	u.mu.Lock()
+	u.handshake = peerTakes
+	u.mu.Unlock()
+	time.Sleep(tailCapAgain * 2)
+	msgs := tailSessionTurn(0, 4)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("turn after the upgrade: %d %s", rec.Code, rec.Body.String())
+	}
+	if !tailCapKnown(t, srv, "peer") {
+		t.Fatal("the stale answer was never asked again")
+	}
+	if got := options(); got != 2 {
+		t.Fatalf("the stale answer was asked %d times, want once more", got)
+	}
+	msgs = tailSessionTurn(0, 5)
+	if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+		t.Fatalf("turn after the re-ask: %d %s", rec.Code, rec.Body.String())
+	}
+	if ct, _, _ := u.last(t); !tail.IsContentType(ct) {
+		t.Fatalf("an upgraded far end still got %q", ct)
+	}
+}
+
+// TestTailEveryUnsupportedAnswerMeansNoTail: the forms "this server has no
+// OPTIONS" takes in the wild all mean the same thing — send it whole.
+func TestTailEveryUnsupportedAnswerMeansNoTail(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hs   tailHandshake
+	}{
+		{"405 from a POST-only server", peerNoOptions},
+		{"404 from a server that routes nothing else", peerNotFound},
+		{"401 from behind a sign-in", peerUnauthorized},
+		{"200 with an HTML page", peerOKNoHeaders},
+		{"another version", peerVersion2},
+		{"another block size", peerWrongBlock},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			u, url := newTailUpstream(t)
+			u.mu.Lock()
+			u.handshake = tc.hs
+			u.mu.Unlock()
+			tailRegisters(t, url, true)
+
+			srv := New()
+			for turn := 1; turn <= 2; turn++ {
+				msgs := tailSessionTurn(0, turn)
+				if rec := chatAsk(t, srv, string(tailPayload(t, "peer/m", msgs))); rec.Code != 200 {
+					t.Fatalf("turn %d: %d %s", turn, rec.Code, rec.Body.String())
+				}
+			}
+			tailCapKnown(t, srv, "peer")
+			for _, ct := range u.types {
+				if tail.IsContentType(ct) {
+					t.Fatalf("a tail was sent anyway (%v)", u.types)
+				}
+			}
+		})
+	}
+}
+
+// TestTailModelsListingAsksTheFarEnds: listing models is what an agent does
+// before its first turn, so the handshake is asked there — no turn waits for it
+// and the first turn already goes as a tail.
+func TestTailModelsListingAsksTheFarEnds(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	u, url := newTailUpstream(t)
+	tailRegisters(t, url, true)
+
+	srv := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+Token)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("listing models: %d %s", rec.Code, rec.Body.String())
+	}
+	if !tailCapWait(t, srv, "peer") {
+		t.Fatal("listing models never asked the far end")
+	}
+	// only the question was asked: no turn went anywhere
+	posts := 0
+	for _, m := range u.seen() {
+		if m == http.MethodPost {
+			posts++
+		}
+	}
+	if posts != 0 {
+		t.Fatalf("listing models sent %d turns upstream", posts)
 	}
 }
