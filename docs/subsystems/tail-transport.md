@@ -5,7 +5,9 @@ uplink that upload is most of the wait before the first token. The tail
 transport sends only the bytes the far end doesn't hold yet: a request body is
 rendered into a stable text stream, cut into fixed blocks and hashed into a
 chain, so a client that knows the far end's prefix can name it and upload only
-the bytes after it. Both ends are magpies, each behind a switch of its own.
+the bytes after it. Both ends are magpies, and at each of them the built-in
+plugin `tail` is the switch: on, that magpie takes such a request apart and sends
+one to the far ends that say they take it.
 
 ## Responsibilities
 
@@ -16,21 +18,41 @@ the bytes after it. Both ends are magpies, each behind a switch of its own.
   resolution (`codec.go`), and hold blocks (`store.go`).
 - **Ingress** (`gateway.tailIngress`, `internal/gateway/tail_wire.go`): put a
   request whose body is only a tail back together before anything reads it.
-- **Egress** (`gateway.tailOut`, `gateway.tailRetransmit`): send a request to a
-  provider marked `tail=on` as the tail of its own body.
+- **Egress** (`gateway.tailOut`, `gateway.tailRetransmit`): send a request as the
+  tail of its own body to a far end that answered the handshake.
+- **Switch and settings** (`plugins/tail`, `internal/tail/gate.go`): the
+  window's Plugins › Built-in row that turns both halves on, and the four
+  numbers they run with.
 - **Out of scope**: no protocol translation, routing or provider fixups change;
   no block cache shared across processes (each gateway's is its own).
 
-## Switches
+## The switch
 
-| Switch | Where | Meaning |
+One switch, in the window's Plugins › Built-in list, for both halves: the
+built-in plugin `tail` (`plugins/tail`, off in the Essentials preset, on
+otherwise like every built-in). On, this magpie puts a tail request back together
+*and* sends tails to the far ends that say they take them. Off, every request
+goes whole in both directions, exactly as before this transport existed.
+
+There is nothing to configure per provider. What a far end takes is what it says
+it takes: the handshake below, asked off every turn's way and believed for a
+while. A provider's URL stays the far end's ordinary Chat base (`…/v1`), and a
+far end that says nothing gets byte-identical requests to what magpie sent before.
+
+The same panel holds the four numbers, from the plugin's `Settings` struct
+([`plugins/tail/tail.go`](../../plugins/tail/tail.go)):
+
+| Setting | Default | What it is |
 | --- | --- | --- |
-| `MAGPIE_TAIL=1` | `gateway.tailOn` (`gateway.TailEnv`) | This gateway puts a tail request back together: a request whose `Content-Type` is `application/x-tail-v3` is answered, and the reply carries the prefix the next turn may name. Off, the default, such a body is not JSON and is turned away as any other body that isn't. It is read from the environment for the same reason `MAGPIE_ADDR` and `MAGPIE_ALLOW_IPS` are: the gateway this transport is for starts in a container, where nobody edits `settings.json`. |
-| `tail=on` on a provider | `provider.Provider.Tail`, set with `magpie provider add … tail=on` / `magpie provider set <id> tail=on` | This provider's Chat requests go over the tail transport. For a provider that is another magpie with its own `tail` switch on. |
+| `capFreshMin` | 30 | minutes a "yes" to the handshake is believed |
+| `capAgainMin` | 5 | minutes a "no" is believed, then asked again |
+| `probeSec` | 3 | seconds the handshake is given |
+| `cacheMB` | 256 | megabytes the block cache may hold |
 
-The provider's URL is the far end's ordinary Chat base (`…/v1`); nothing about
-the URL says "tail". A provider without the switch talks to the same URL as it
-always did, which is what makes an A/B a change of provider and nothing else.
+They are read on the plugin's `Apply`, so an edited value applies when the
+transport is turned off and on again, or magpie starts. The switch itself is
+immediate: the plugin serves `internal/tail`'s point on `Apply` and stops it on
+dispose, so the next request sees it (nothing is cached — `tail.Served()`).
 
 ## Wire format
 
@@ -69,8 +91,9 @@ OPTIONS {the URL the request would POST to}
 is nothing new for a far end to implement. The block size is in the answer
 because two implementations that disagree on it never hit — the client would name
 a boundary the peer's chain does not have — so it is advertised instead of
-assumed. A gateway with `MAGPIE_TAIL` off answers too, without `X-Tail-Version`:
-"JSON only" is an answer worth having.
+assumed. A gateway with the transport off answers too, without `X-Tail-Version`:
+"JSON only" is an answer worth having, and it is how a far end upgraded later is
+found within `capAgainMin`.
 
 **It is never asked on a turn's way.** Three states, and only one of them sends a
 tail:
@@ -78,8 +101,8 @@ tail:
 | State | What a turn does | How it is left |
 | --- | --- | --- |
 | unknown | **goes whole — plain JSON**, exactly as before this transport existed | a background `OPTIONS` is started, once, and this turn does not wait for it |
-| takes | the tail transport | the answer is believed for `tailCapFresh` (30 min) |
-| does not | **goes whole, always** | believed for `tailCapAgain` (5 min), then asked again |
+| takes | the tail transport | the answer is believed for `capFreshMin` (30 min) |
+| does not | **goes whole, always** | believed for `capAgainMin` (5 min), then asked again |
 
 So the handshake costs a turn no latency at all, and costs a fresh conversation
 nothing it wasn't already paying: its first turn is a full one either way. The
@@ -89,9 +112,9 @@ there before the turn is, and the first turn already goes as a tail.
 
 Two consequences worth stating plainly:
 
-- **Deployment order stops mattering.** The client may be given `tail=on` before
-  the far end is upgraded; it asks, is told no, and sends whole requests until the
-  answer changes. The old failure mode was a first request that wasn't JSON
+- **Deployment order stops mattering.** The near end may be upgraded (or turned
+  on) before the far end is; it asks, is told no, and sends whole requests until
+  the answer changes. The old failure mode was a first request that wasn't JSON
   meeting a server that parsed JSON: a 400/415 per turn, counted as an upstream
   failure — or, worse, a 200 from something that read nothing.
 - **A lying far end costs one retry, not a broken turn.** If it answered the
@@ -120,9 +143,9 @@ Ingress, one Chat turn:
 
 Egress, one Chat turn:
 
-1. `Server.forwardOnce` finalizes the body, then calls `Server.tailOut`. A
-   provider without `tail=on`, another protocol, or an encoded body leaves the
-   request untouched. So does a far end that has not answered the handshake:
+1. `Server.forwardOnce` finalizes the body, then calls `Server.tailOut`. The
+   transport off, another protocol, the whole-request retry of `tailFallback`, or
+   an encoded body leaves the request untouched. So does a far end that has not answered the handshake:
    `tailOut` asks `tailCapable` first, which answers from cache and never probes
    on the request's way: an unknown answer means this turn goes whole, and the
    question is asked in the background.
@@ -141,22 +164,22 @@ Egress, one Chat turn:
 
 - **Capability**: per provider, in memory (`Server.tailCaps`), the far end's
   answer to the handshake and when that answer goes stale. Not persisted: a
-  restarted gateway asks again, which is one OPTIONS per tail=on provider, off
-  any turn's way.
+  restarted gateway asks again, which is one OPTIONS per provider, off any
+  turn's way.
 - **Client credential table**: per provider, in memory (`Server.tailClients`),
   `session → [(length, tip)]`. A session is the body's own content, so it needs
   no bookkeeping across restarts: a fresh gateway simply misses and gets the
   whole request.
-- **Block cache**: one per gateway (`Server.tailSrv`, 256 MB budget), holding
+- **Block cache**: one per gateway (`Server.tailSrv`, `cacheMB` budget, rebuilt
+  when that size changes), holding
   `parent → content` and a chain walkable from a tip. It is not shared between
   gateway processes; a session that moves to another gateway gets one 409 and
   one full upload, then is cached there.
 
 ## Failure and compatibility
 
-- Both switches off (the default): no behavior change anywhere. A body that
-  isn't JSON is rejected exactly as before, and a request that isn't a tail is
-  never probed.
+- The switch off: no behavior change anywhere. A body that isn't JSON is
+  rejected exactly as before, and nothing is probed.
 - A far end that doesn't answer the handshake is never sent a tail, so its turns
   are byte-identical to what magpie sent before this transport existed.
 - A far end that lost the prefix costs one 409 and one full upload; the agent
@@ -183,17 +206,18 @@ payload must match byte for byte, since two implementations that disagree on a
 block boundary never hit.
 
 `internal/gateway/tail_wire_test.go` covers: a tail turn reaching the vendor
-whole, the switch being what serves one, a provider marked `tail=on` sending
+whole, the switch being the only configuration there is (a panel turned on
+serving a tail and sending one, with nothing set on the provider), sending
 only its new bytes, a far end that lost the prefix being asked for the whole
 request exactly once, four conversations in flight together arriving as twelve
 un-mixed histories, and a far end that came back empty being recovered from in
 one turn. `internal/tail/codec_test.go` pins the credential table under
 out-of-order replies (and shows what a one-entry table would have lost).
 
-For the two ends together, run two of the built binary — one with `MAGPIE_TAIL=1`
-and a provider at the inference service, one with a `tail=on` provider pointed at
-the first — and compare what a TCP counter between them sees against the same
-turns sent as plain JSON.
+For the two ends together, run two of the built binary with the plugin on, one
+with a provider at the inference service and one with a provider pointed at the
+first, and compare what a TCP counter between them sees against the same turns
+sent with the plugin off.
 
 The conditions a real deployment runs in — several sessions at once, replies
 arriving out of order, the gateway restarted under a conversation — are checked
